@@ -15,19 +15,203 @@ is a per-session random value generated client-side by the OPAC JS app.
 import base64
 import hashlib
 import hmac
+import http.cookiejar
 import json
 import re
 import secrets
 import time
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import date, timedelta
 from urllib.parse import parse_qs, urlparse
-
-import httpx
 
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """
+    Build an SSL context for HTTPS requests.
+
+    Uses certifi's CA bundle when available (common on Windows Python installs
+    where the system store is incomplete for some hosts like login.kb.nl).
+    Falls back to the platform default otherwise — no extra package required.
+    """
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+class _FixHostnameHTTPSHandler(urllib.request.HTTPSHandler):
+    """Strip trailing dots from hostnames before SSL connects (Windows DNS fix)."""
+
+    def __init__(self):
+        super().__init__(context=_ssl_context())
+
+    def https_open(self, req):
+        host = req.host
+        if ":" in host:
+            h, p = host.rsplit(":", 1)
+            req.host = h.rstrip(".") + ":" + p
+        else:
+            req.host = host.rstrip(".")
+        return super().https_open(req)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class _HttpResponse:
+    def __init__(self, status: int, headers, body: bytes, url: str):
+        self.status_code = status
+        self.headers = headers
+        self._body = body
+        self.url = url
+
+    @property
+    def text(self) -> str:
+        return self._body.decode("utf-8", errors="replace")
+
+    def json(self) -> dict:
+        return json.loads(self.text)
+
+    @property
+    def is_redirect(self) -> bool:
+        return self.status_code in (301, 302, 303, 307, 308)
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(
+                f"HTTP {self.status_code}: {self.text[:500]}"
+            )
+
+
+def _resolve_redirect(current_url: str, location: str) -> str:
+    return urllib.parse.urljoin(current_url, location)
+
+
+def _urlopen(req: urllib.request.Request, timeout: int = 15):
+    host = req.host if hasattr(req, "host") else ""
+    if host:
+        if ":" in host:
+            h, p = host.rsplit(":", 1)
+            req.host = h.rstrip(".") + ":" + p
+        else:
+            req.host = host.rstrip(".")
+    return urllib.request.build_opener(_FixHostnameHTTPSHandler()).open(req, timeout=timeout)
+
+
+def _build_opener(*, follow_redirects: bool = True, cookies: bool = False):
+    handlers: list = [_FixHostnameHTTPSHandler()]
+    if cookies:
+        handlers.insert(0, urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    if follow_redirects:
+        handlers.append(urllib.request.HTTPRedirectHandler())
+    else:
+        handlers.append(_NoRedirectHandler())
+    return urllib.request.build_opener(*handlers)
+
+
+def _url_with_params(url: str, params: dict | None) -> str:
+    if not params:
+        return url
+    query = urllib.parse.urlencode(params)
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}{query}"
+
+
+def _opener_request(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    *,
+    method: str = "GET",
+    data: bytes | None = None,
+    headers: dict | None = None,
+    timeout: int = 30,
+) -> _HttpResponse:
+    req = urllib.request.Request(url, data=data, method=method)
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return _HttpResponse(resp.status, resp.headers, resp.read(), resp.geturl())
+    except urllib.error.HTTPError as exc:
+        return _HttpResponse(exc.code, exc.headers, exc.read(), exc.geturl())
+
+
+def _http_get(
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: int = 15,
+    follow_redirects: bool = True,
+) -> _HttpResponse:
+    opener = _build_opener(follow_redirects=follow_redirects)
+    return _opener_request(
+        opener,
+        _url_with_params(url, params),
+        headers=headers,
+        timeout=timeout,
+    )
+
+
+def _http_post(
+    url: str,
+    *,
+    headers: dict | None = None,
+    json_body: dict | None = None,
+    form: dict | None = None,
+    timeout: int = 30,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> _HttpResponse:
+    data = None
+    hdrs = dict(headers or {})
+    if json_body is not None:
+        data = json.dumps(json_body).encode()
+        hdrs.setdefault("Content-Type", "application/json")
+    elif form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        hdrs.setdefault("Content-Type", "application/x-www-form-urlencoded")
+
+    if opener is None:
+        opener = _build_opener()
+    return _opener_request(opener, url, method="POST", data=data, headers=hdrs, timeout=timeout)
+
+
+def _api_json(
+    method: str,
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    body: dict | None = None,
+    timeout: int = 15,
+) -> dict | list:
+    full_url = _url_with_params(url, params)
+    payload = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(full_url, data=payload, method=method)
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    if payload is not None:
+        req.add_header("Content-Type", "application/json")
+
+    try:
+        with _urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {detail[:500]}") from exc
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -76,16 +260,16 @@ def _fetch_wise_credentials(branch_id: str = "2850") -> tuple[str, str]:
         "Accept": "text/html,application/xhtml+xml,*/*",
     }
     page_url = f"{_WISE_OPAC_BASE}/branch/{branch_id}/catalog/search"
-    r = httpx.get(page_url, headers=headers, timeout=20, follow_redirects=True)
+    r = _http_get(page_url, headers=headers, timeout=20)
     r.raise_for_status()
 
     m = re.search(r"main-[A-Z0-9]+\.js", r.text)
     if not m:
         raise RuntimeError("Could not find main-*.js in OPAC page")
 
-    r = httpx.get(
+    r = _http_get(
         f"{_WISE_OPAC_BASE}/{m.group(0)}",
-        headers={**headers, "Referer": str(r.url), "Accept": "*/*"},
+        headers={**headers, "Referer": r.url, "Accept": "*/*"},
         timeout=30,
     )
     r.raise_for_status()
@@ -209,12 +393,34 @@ class LibraryClient:
         state = secrets.token_urlsafe(16)
         nonce = secrets.token_urlsafe(16)
 
-        with httpx.Client(follow_redirects=False, timeout=30) as client:
-            # ── Step 1: initiate OIDC at Keycloak ─────────────────────────
-            # Keycloak redirects through its broker to login.kb.nl
-            r = client.get(
+        opener = _build_opener(follow_redirects=False, cookies=True)
+        opener.addheaders = [("User-Agent", _BROWSER_UA)]
+
+        def _get(url: str, headers: dict | None = None) -> _HttpResponse:
+            return _opener_request(opener, url, headers=headers, timeout=30)
+
+        def _post(
+            url: str,
+            *,
+            headers: dict | None = None,
+            json_body: dict | None = None,
+            form: dict | None = None,
+        ) -> _HttpResponse:
+            return _http_post(
+                url,
+                headers=headers,
+                json_body=json_body,
+                form=form,
+                opener=opener,
+                timeout=30,
+            )
+
+        # ── Step 1: initiate OIDC at Keycloak ─────────────────────────
+        # Keycloak redirects through its broker to login.kb.nl
+        r = _get(
+            _url_with_params(
                 KEYCLOAK_AUTH_URL,
-                params={
+                {
                     "response_type": "code",
                     "client_id": OIDC_CLIENT_ID,
                     "redirect_uri": self._redirect_uri,
@@ -225,108 +431,102 @@ class LibraryClient:
                     "nonce": nonce,
                 },
             )
+        )
 
-            # Follow redirects until we land on the KB login page
-            for _ in range(10):
-                if not r.is_redirect:
-                    break
-                location = r.headers.get("location", "")
-                r = client.get(location)
-                if "login.kb.nl/si/login/" in str(r.url):
-                    break
+        # Follow redirects until we land on the KB login page
+        for _ in range(10):
+            if not r.is_redirect:
+                break
+            location = r.headers.get("Location", "")
+            r = _get(_resolve_redirect(r.url, location))
+            if "login.kb.nl/si/login/" in r.url:
+                break
 
-            login_page_url = str(r.url)
+        login_page_url = r.url
 
-            # ── Step 2: extract goto_url, then POST credentials ────────────
-            parsed = urlparse(login_page_url)
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            goto_url = qs.get("goto", [""])[0]
+        # ── Step 2: extract goto_url, then POST credentials ────────────
+        parsed = urlparse(login_page_url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        goto_url = qs.get("goto", [""])[0]
 
-            if not goto_url:
-                raise RuntimeError(
-                    "Could not find goto parameter on KB login page. "
-                    f"Landed on: {login_page_url}"
-                )
-
-            r = client.post(
-                KB_LOGIN_URL,
-                json={
-                    "module": "UsernameAndPassword",
-                    "definition": {
-                        "rememberMe": False,
-                        "username": self.username,
-                        "password": self.password,
-                    },
-                },
-                headers={
-                    "Content-Type": "application/json",
-                    "Goto-Url": goto_url,
-                    "Referer": login_page_url,
-                    "Origin": "https://login.kb.nl",
-                },
+        if not goto_url:
+            raise RuntimeError(
+                "Could not find goto parameter on KB login page. "
+                f"Landed on: {login_page_url}"
             )
 
-            if r.status_code != 200:
-                raise RuntimeError(
-                    f"KB login failed (HTTP {r.status_code}): {r.text[:500]}"
-                )
-
-            resp = r.json()
-            if resp.get("nextModule") != "Success":
-                msg = resp.get("message") or r.text[:200]
-                raise RuntimeError(f"KB login rejected: {msg}")
-
-            # ── Step 3: follow goto_url → Keycloak broker → redirect_uri?code= ──
-            # The chain is:
-            #   login.kb.nl/authorize  →  iam-emea broker endpoint?code=KB_CODE
-            #                          →  bibliotheek.wise.oclc.org?code=KEYCLOAK_CODE
-            # We must follow the broker hop and only extract the code from the
-            # FINAL redirect back to our redirect_uri host.
-            redirect_host = "bibliotheek.wise.oclc.org"
-            r = client.get(goto_url)
-            code = None
-            for _ in range(15):
-                if not r.is_redirect:
-                    break
-                location = r.headers.get("location", "")
-                if redirect_host in location:
-                    m = re.search(r"[?&]code=([^&#\s]+)", location)
-                    if m:
-                        code = m.group(1)
-                        break
-                r = client.get(location)
-
-            if not code:
-                raise RuntimeError(
-                    "OIDC flow completed but no authorization code was returned."
-                )
-
-            # ── Step 4: exchange code for tokens ──────────────────────────
-            r = client.post(
-                TOKEN_URL,
-                data={
-                    "grant_type": "authorization_code",
-                    "client_id": OIDC_CLIENT_ID,
-                    "redirect_uri": self._redirect_uri,
-                    "code": code,
-                    "code_verifier": code_verifier,
+        r = _post(
+            KB_LOGIN_URL,
+            json_body={
+                "module": "UsernameAndPassword",
+                "definition": {
+                    "rememberMe": False,
+                    "username": self.username,
+                    "password": self.password,
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            },
+            headers={
+                "Goto-Url": goto_url,
+                "Referer": login_page_url,
+                "Origin": "https://login.kb.nl",
+            },
+        )
+
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"KB login failed (HTTP {r.status_code}): {r.text[:500]}"
             )
 
-            if r.status_code != 200:
-                raise RuntimeError(
-                    f"Token exchange failed (HTTP {r.status_code}): {r.text[:500]}"
-                )
+        resp = r.json()
+        if resp.get("nextModule") != "Success":
+            msg = resp.get("message") or r.text[:200]
+            raise RuntimeError(f"KB login rejected: {msg}")
 
-            token_data = r.json()
-            self._access_token = token_data["access_token"]
+        # ── Step 3: follow goto_url → Keycloak broker → redirect_uri?code= ──
+        redirect_host = "bibliotheek.wise.oclc.org"
+        r = _get(goto_url)
+        code = None
+        for _ in range(15):
+            if not r.is_redirect:
+                break
+            location = _resolve_redirect(r.url, r.headers.get("Location", ""))
+            if redirect_host in location:
+                m = re.search(r"[?&]code=([^&#\s]+)", location)
+                if m:
+                    code = m.group(1)
+                    break
+            r = _get(location)
 
-            claims = _decode_jwt_payload(self._access_token)
-            self._patron_id = claims.get("wiseUuid")
+        if not code:
+            raise RuntimeError(
+                "OIDC flow completed but no authorization code was returned."
+            )
 
-            if not self._patron_id:
-                raise RuntimeError("Access token has no wiseUuid claim; cannot identify patron.")
+        # ── Step 4: exchange code for tokens ──────────────────────────
+        r = _post(
+            TOKEN_URL,
+            form={
+                "grant_type": "authorization_code",
+                "client_id": OIDC_CLIENT_ID,
+                "redirect_uri": self._redirect_uri,
+                "code": code,
+                "code_verifier": code_verifier,
+            },
+        )
+
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Token exchange failed (HTTP {r.status_code}): {r.text[:500]}"
+            )
+
+        token_data = r.json()
+        self._access_token = token_data["access_token"]
+
+        claims = _decode_jwt_payload(self._access_token)
+        self._patron_id = claims.get("wiseUuid")
+
+        if not self._patron_id:
+            raise RuntimeError("Access token has no wiseUuid claim; cannot identify patron.")
 
     # ------------------------------------------------------------------
     # Public API
@@ -349,7 +549,8 @@ class LibraryClient:
         """
         # Search requires both WISE_KEY and Bearer token.
         self.ensure_logged_in()
-        r = httpx.get(
+        data = _api_json(
+            "GET",
             f"{WISE_BASE}/branch/{self.branch_id}"
             f"/perspective/{SEARCH_PERSPECTIVE}/titlesummary",
             params={
@@ -363,10 +564,7 @@ class LibraryClient:
                 "clientMode": "BRANCH",
             },
             headers=self._headers(auth=True),
-            timeout=15,
         )
-        r.raise_for_status()
-        data = r.json()
 
         results = []
         for item in data.get("items", []):
@@ -405,14 +603,12 @@ class LibraryClient:
         Returns dict with 'available' (bool), 'hold_allowed' (bool),
         and a detailed 'availability' list from the server.
         """
-        r = httpx.get(
+        items = _api_json(
+            "GET",
             f"{WISE_BASE}/branch/{self.branch_id}/titleavailability/{title_id}",
             params={"clientType": "PUBLIC"},
             headers=self._headers(),
-            timeout=15,
         )
-        r.raise_for_status()
-        items = r.json()
 
         if not items:
             return {
@@ -441,7 +637,8 @@ class LibraryClient:
 
         holds: list[dict] = []
         for reservation_type in ("STANDARD", "SEQUENTIAL"):
-            r = httpx.get(
+            data = _api_json(
+                "GET",
                 f"{WISE_BASE}/patron/{self._patron_id}"
                 f"/library/{self.library_id}/hold",
                 params={
@@ -450,10 +647,8 @@ class LibraryClient:
                     "reservationType": reservation_type,
                 },
                 headers=self._headers(auth=True),
-                timeout=15,
             )
-            r.raise_for_status()
-            for item in r.json().get("items", []):
+            for item in data.get("items", []):
                 holds.append(
                     {
                         "hold_id": item.get("id"),
@@ -480,16 +675,15 @@ class LibraryClient:
         """
         self.ensure_logged_in()
 
-        r = httpx.get(
+        data = _api_json(
+            "GET",
             f"{WISE_BASE}/patron/{self._patron_id}/library/{self.library_id}/loan",
             params={"offset": 0},
             headers=self._headers(auth=True),
-            timeout=15,
         )
-        r.raise_for_status()
 
         loans = []
-        for item in r.json().get("items", []):
+        for item in data.get("items", []):
             loans.append(
                 {
                     "loan_id": item.get("id"),
@@ -551,15 +745,13 @@ class LibraryClient:
             "holdOptionsBranchId": pickup,
         }
 
-        r = httpx.post(
+        details = _api_json(
+            "POST",
             f"{WISE_BASE}/patron/{self._patron_id}/hold",
-            json=payload,
             headers={
                 **self._headers(auth=True),
-                "Content-Type": "application/json",
                 "Origin": "https://bibliotheek.wise.oclc.org",
             },
-            timeout=15,
+            body=payload,
         )
-        r.raise_for_status()
-        return {"success": True, "details": r.json()}
+        return {"success": True, "details": details}
