@@ -1,0 +1,6 @@
+name: bibliotheek
+version: "1.0"
+description: "Search, check availability, and place holds at your local OCLC WISE library (KB Digital Membership / iWelcome login)."
+requires_env:
+  - LIBRARY_USERNAME
+  - LIBRARY_PASSWORD

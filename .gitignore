@@ -1,0 +1,13 @@
+# HAR captures and inspector — development tools only, not part of the plugin
+*.har
+har_inspect.py
+
+# Credentials
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
