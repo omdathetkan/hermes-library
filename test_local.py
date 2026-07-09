@@ -106,15 +106,21 @@ def test_loans(client: LibraryClient):
 
 
 def test_holds(client: LibraryClient):
-    section("Active holds (reservations)")
-    holds = client.list_holds()
-    if not holds:
-        print("  (no active holds)")
-    for hold in holds:
-        pickup = f"pickup: {hold['pickup_location']}" if hold["pickup_location"] else ""
-        print(f"  [{hold['hold_id']}] {hold['title']}")
-        print(f"         author: {hold['author']}")
-        print(f"         status: {hold['status']}  queue: #{hold['queue_position']}  {pickup}")
+    section("Active holds (all linked accounts)")
+    accounts = client.list_holds()
+    if not accounts:
+        print("  (no accounts)")
+        return
+    for account_name, account in accounts.items():
+        holds = account["holds"]
+        print(f"\n  {account_name} ({len(holds)} holds)")
+        if not holds:
+            print("    (no active holds)")
+        for hold in holds:
+            pickup = f"pickup: {hold['pickup_location']}" if hold["pickup_location"] else ""
+            print(f"    [{hold['hold_id']}] {hold['title']}")
+            print(f"           author: {hold['author']}")
+            print(f"           status: {hold['status']}  queue: #{hold['queue_position']}  {pickup}")
 
 
 # ---------------------------------------------------------------------------

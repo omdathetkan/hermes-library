@@ -1,10 +1,11 @@
 """
 Bibliotheek WISE Hermes plugin.
 
-Registers four tools:
+Registers five tools:
   library_search        — search the catalog
   library_availability  — check availability of a specific title
-  library_list_holds    — list active holds for the logged-in patron
+  library_list_loans    — list loans across all linked accounts
+  library_list_holds    — list holds across all linked accounts
   library_place_hold    — place a reservation
 
 Install to ~/.hermes/plugins/bibliotheek/ and set env vars (see .env.example).
@@ -122,7 +123,7 @@ def register(ctx):
             "name": "library_list_loans",
             "description": (
                 "List all library items currently on loan, grouped by account name. "
-                "Includes the logged-in member and any linked accounts (e.g. children). "
+                "Always includes the logged-in member and any linked accounts (e.g. children). "
                 "Each account has patron_id and a loans list with title, author, loan date, "
                 "due date, renewal status, and fines."
             ),
@@ -141,12 +142,14 @@ def register(ctx):
     ctx.register_tool(
         name="library_list_holds",
         toolset="bibliotheek",
-        description="List all active holds (reservations) for the logged-in library member.",
+        description="List all active holds across the logged-in member and linked accounts.",
         schema={
             "name": "library_list_holds",
             "description": (
-                "List all active holds and reservations placed by the logged-in "
-                "library member. Shows title, status, queue position, and pickup location."
+                "List all active holds and reservations, grouped by account name. "
+                "Always includes the logged-in member and any linked accounts (e.g. children). "
+                "Each account has patron_id and a holds list with title, status, queue "
+                "position, and pickup location."
             ),
             "parameters": {
                 "type": "object",

@@ -550,6 +550,13 @@ class LibraryClient:
                 patrons.append((name, patron_id))
         return patrons
 
+    def _get_all_accounts(self) -> dict[str, str]:
+        """Return {display_name: patron_system_id} for primary and linked accounts."""
+        accounts = {self._actor_name or "Primary account": self._patron_id}
+        for name, patron_id in self._get_delegated_patrons():
+            accounts[name] = patron_id
+        return accounts
+
     @staticmethod
     def _format_loan_item(item: dict) -> dict:
         return {
@@ -675,69 +682,78 @@ class LibraryClient:
             "availability": avail,
         }
 
-    def list_holds(self) -> list[dict]:
-        """
-        Return all active holds/reservations for the logged-in patron.
+    @staticmethod
+    def _format_hold_item(item: dict, reservation_type: str) -> dict:
+        return {
+            "hold_id": item.get("id"),
+            "title": item.get("title"),
+            "author": item.get("author"),
+            "status": item.get("holdStatus"),
+            "queue_position": item.get("queuePosition"),
+            "awaiting_pickup": item.get("awaitingPickup"),
+            "pickup_location": item.get("pickupLocationName"),
+            "request_due_date": item.get("requestDueDate"),
+            "hold_placed_date": item.get("holdPlacedDate"),
+            "bibliographic_record_id": item.get("bibliographicRecordId"),
+            "reservation_type": reservation_type,
+        }
 
-        Fetches both SEQUENTIAL and STANDARD reservation types and merges them.
-        """
-        self.ensure_logged_in()
-
+    def _list_holds_for_patron(self, patron_id: str) -> list[dict]:
         holds: list[dict] = []
         for reservation_type in ("STANDARD", "SEQUENTIAL"):
-            data = _api_json(
-                "GET",
-                f"{WISE_BASE}/patron/{self._patron_id}"
-                f"/library/{self.library_id}/hold",
-                params={
-                    "offset": 0,
-                    "limit": 100,
-                    "reservationType": reservation_type,
-                },
-                headers=self._headers(auth=True),
-            )
-            for item in data.get("items", []):
-                holds.append(
-                    {
-                        "hold_id": item.get("id"),
-                        "title": item.get("title"),
-                        "author": item.get("author"),
-                        "status": item.get("holdStatus"),
-                        "queue_position": item.get("queuePosition"),
-                        "awaiting_pickup": item.get("awaitingPickup"),
-                        "pickup_location": item.get("pickupLocationName"),
-                        "request_due_date": item.get("requestDueDate"),
-                        "hold_placed_date": item.get("holdPlacedDate"),
-                        "bibliographic_record_id": item.get("bibliographicRecordId"),
-                        "reservation_type": reservation_type,
-                    }
+            try:
+                data = _api_json(
+                    "GET",
+                    f"{WISE_BASE}/patron/{patron_id}"
+                    f"/library/{self.library_id}/hold",
+                    params={
+                        "offset": 0,
+                        "limit": 100,
+                        "reservationType": reservation_type,
+                    },
+                    headers=self._headers(auth=True),
+                    timeout=30,
                 )
+            except RuntimeError as exc:
+                if "403" in str(exc):
+                    return []
+                raise
+            except (urllib.error.URLError, TimeoutError):
+                continue
+            for item in data.get("items", []):
+                holds.append(self._format_hold_item(item, reservation_type))
         return holds
+
+    def list_holds(self) -> dict[str, dict]:
+        """
+        Return all active holds/reservations, grouped by account name.
+
+        Always includes the logged-in patron and linked accounts (e.g. children).
+        Linked accounts without hold access return an empty holds list.
+        """
+        self.ensure_logged_in()
+        return {
+            name: {
+                "patron_id": patron_id,
+                "holds": self._list_holds_for_patron(patron_id),
+            }
+            for name, patron_id in self._get_all_accounts().items()
+        }
 
     def list_loans(self) -> dict[str, dict]:
         """
         Return all items on loan, grouped by account name.
 
-        Includes the logged-in patron and any linked accounts (e.g. children)
-        discovered via the delegator endpoint. Each account entry contains
-        patron_id and a loans list.
+        Always includes the logged-in patron and linked accounts (e.g. children).
         """
         self.ensure_logged_in()
-
-        accounts: dict[str, dict] = {}
-        primary_name = self._actor_name or "Primary account"
-        accounts[primary_name] = {
-            "patron_id": self._patron_id,
-            "loans": self._list_loans_for_patron(self._patron_id),
-        }
-
-        for name, patron_id in self._get_delegated_patrons():
-            accounts[name] = {
+        return {
+            name: {
                 "patron_id": patron_id,
                 "loans": self._list_loans_for_patron(patron_id),
             }
-
-        return accounts
+            for name, patron_id in self._get_all_accounts().items()
+        }
 
     def place_hold(
         self,
