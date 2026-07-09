@@ -232,6 +232,19 @@ OIDC_CLIENT_ID = "opac-via-external-idp"
 # Perspective 3682 = default "all media" search perspective for this library.
 SEARCH_PERSPECTIVE = "3682"
 
+# Human-readable labels for WISE effectiveStatus / availability status values.
+_STATUS_LABELS = {
+    "AVAILABLE": "Available",
+    "ON_LOAN": "Loaned out",
+    "IN_TRANSIT": "On the way",
+    "ON_ORDER": "On order",
+    "JUST_RETURNED": "Just returned",
+    "NOT_AVAILABLE": "Not available",
+    "DISCARDED": "Discarded",
+    "DISCARDED_FOR_SALE": "Discarded for sale",
+    "UNKNOWN_STATUS": "Unknown",
+}
+
 # WISE_KEY is a daily rotating HMAC-SHA256 token derived from credentials
 # embedded in the OPAC JavaScript bundle.  We replicate the browser's algorithm:
 #   epochDay    = floor(Date.now() / 86_400_000)   # UTC, not local calendar date
@@ -574,6 +587,149 @@ class LibraryClient:
             "bibliographic_record_id": item.get("bibliographicRecordId"),
         }
 
+    @staticmethod
+    def _status_label(status: str | None) -> str:
+        if not status:
+            return "Unknown"
+        return _STATUS_LABELS.get(status, status.replace("_", " ").title())
+
+    def _fetch_title_availability_bulk(
+        self, title_ids: list[str]
+    ) -> dict[str, dict]:
+        """Fetch summary availability for multiple titles in one request."""
+        if not title_ids:
+            return {}
+
+        ids_path = ",".join(title_ids)
+        data = _api_json(
+            "GET",
+            f"{WISE_BASE}/branch/{self.branch_id}/titleavailability/{ids_path}",
+            params={"clientType": "PUBLIC"},
+            headers=self._headers(),
+        )
+        return {
+            str(item["bibliographicRecordId"]): item
+            for item in data
+            if item.get("bibliographicRecordId") is not None
+        }
+
+    def _fetch_item_information(
+        self, title_id: str, cat_group: int
+    ) -> list[dict]:
+        """Fetch per-copy availability at branches for one catalog group."""
+        data = _api_json(
+            "GET",
+            f"{WISE_BASE}/title/{title_id}/iteminformation",
+            params={
+                "branchCatGroups": str(cat_group),
+                "branchId": self.branch_id,
+                "clientType": "I",
+            },
+            headers=self._headers(),
+        )
+        return data if isinstance(data, list) else []
+
+    @staticmethod
+    def _format_copy_item(item: dict) -> dict:
+        return {
+            "branch_id": item.get("branchId"),
+            "branch_name": item.get("branchName"),
+            "status": item.get("effectiveStatus"),
+            "status_code": item.get("effectiveStatusCode"),
+            "status_label": LibraryClient._status_label(item.get("effectiveStatus")),
+            "location": item.get("location"),
+            "sub_location": item.get("subLocation"),
+            "shelf": item.get("shelfDescription"),
+            "call_number": item.get("callNumber"),
+            "return_date": item.get("returnDate"),
+            "barcode": item.get("barcode"),
+        }
+
+    @staticmethod
+    def _aggregate_locations(copies: list[dict]) -> list[dict]:
+        """Group copies by branch and status, with counts (like the OPAC list)."""
+        groups: dict[tuple, dict] = {}
+        for copy in copies:
+            key = (
+                copy.get("branch_id"),
+                copy.get("branch_name"),
+                copy.get("status"),
+            )
+            if key not in groups:
+                groups[key] = {
+                    "branch_id": copy.get("branch_id"),
+                    "branch_name": copy.get("branch_name"),
+                    "status": copy.get("status"),
+                    "status_code": copy.get("status_code"),
+                    "status_label": copy.get("status_label"),
+                    "count": 0,
+                    "return_dates": [],
+                    "shelves": [],
+                }
+            entry = groups[key]
+            entry["count"] += 1
+            if copy.get("return_date"):
+                entry["return_dates"].append(copy["return_date"])
+            shelf = copy.get("shelf") or copy.get("sub_location")
+            if shelf and shelf not in entry["shelves"]:
+                entry["shelves"].append(shelf)
+
+        locations = []
+        for entry in groups.values():
+            entry["return_date"] = entry.pop("return_dates")[0] if entry["return_dates"] else None
+            entry.pop("return_dates", None)
+            locations.append(entry)
+        return sorted(
+            locations,
+            key=lambda loc: (loc.get("branch_name") or "", loc.get("status") or ""),
+        )
+
+    def _enrich_availability(self, title_id: str, record: dict | None = None) -> dict:
+        """
+        Build full availability for a title: summary per catalog group plus
+        per-branch location counts and statuses from item information.
+        """
+        if record is None:
+            bulk = self._fetch_title_availability_bulk([title_id])
+            record = bulk.get(title_id)
+        if not record:
+            return {
+                "title_id": title_id,
+                "available": False,
+                "hold_allowed": False,
+                "availability_summary": [],
+                "locations": [],
+            }
+
+        summary_raw = record.get("availability", [])
+        availability_summary = [
+            {
+                "cat_group": entry.get("catGroup"),
+                "status": entry.get("status"),
+                "status_code": entry.get("statusCode"),
+                "status_label": self._status_label(entry.get("status")),
+            }
+            for entry in summary_raw
+        ]
+
+        copies: list[dict] = []
+        seen_cat_groups = {
+            entry["cat_group"]
+            for entry in availability_summary
+            if entry.get("cat_group") is not None
+        }
+        for cat_group in sorted(seen_cat_groups):
+            for item in self._fetch_item_information(title_id, cat_group):
+                copies.append(self._format_copy_item(item))
+
+        return {
+            "title_id": title_id,
+            "available": any(a.get("status") == "AVAILABLE" for a in summary_raw),
+            "hold_allowed": record.get("holdAllowed", False),
+            "availability_summary": availability_summary,
+            "locations": self._aggregate_locations(copies),
+        }
+
     def _list_loans_for_patron(self, patron_id: str) -> list[dict]:
         data = _api_json(
             "GET",
@@ -600,7 +756,8 @@ class LibraryClient:
         scope: 'title' | 'author' | 'isbn'
         Returns dict with 'total' and 'results' list.
         Each result includes title_id (for availability / hold placement),
-        title, author, year, media type, and ISBN.
+        title, author, year, media type, ISBN, and per-branch availability
+        (location counts and copy status such as available, loaned out, on the way).
         """
         # Search requires both WISE_KEY and Bearer token.
         self.ensure_logged_in()
@@ -649,38 +806,28 @@ class LibraryClient:
                 }
             )
 
+        title_ids = [r["title_id"] for r in results if r.get("title_id")]
+        avail_by_id = self._fetch_title_availability_bulk(title_ids)
+        for result in results:
+            tid = result.get("title_id")
+            if not tid:
+                continue
+            avail = self._enrich_availability(tid, avail_by_id.get(tid))
+            result["available"] = avail["available"]
+            result["hold_allowed"] = avail["hold_allowed"]
+            result["availability_summary"] = avail["availability_summary"]
+            result["locations"] = avail["locations"]
+
         return {"total": data.get("total", 0), "results": results}
 
     def check_availability(self, title_id: str) -> dict:
         """
         Check the availability of a title by its bibliographic record ID.
 
-        Returns dict with 'available' (bool), 'hold_allowed' (bool),
-        and a detailed 'availability' list from the server.
+        Returns availability summary per catalog group, plus per-branch location
+        counts and copy statuses (available, loaned out, on the way, etc.).
         """
-        items = _api_json(
-            "GET",
-            f"{WISE_BASE}/branch/{self.branch_id}/titleavailability/{title_id}",
-            params={"clientType": "PUBLIC"},
-            headers=self._headers(),
-        )
-
-        if not items:
-            return {
-                "title_id": title_id,
-                "available": False,
-                "hold_allowed": False,
-                "availability": [],
-            }
-
-        item = items[0]
-        avail = item.get("availability", [])
-        return {
-            "title_id": title_id,
-            "available": any(a.get("status") == "AVAILABLE" for a in avail),
-            "hold_allowed": item.get("holdAllowed", False),
-            "availability": avail,
-        }
+        return self._enrich_availability(title_id)
 
     @staticmethod
     def _format_hold_item(item: dict, reservation_type: str) -> dict:

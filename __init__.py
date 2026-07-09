@@ -53,9 +53,10 @@ def register(ctx):
         schema={
             "name": "library_search",
             "description": (
-                "Search the local library catalog. Returns a list of titles with "
-                "their title_id, author, publication year, media type, and ISBN. "
-                "Use the returned title_id with library_availability or library_place_hold."
+                "Search the local library catalog. Returns titles with title_id, author, "
+                "year, media type, ISBN, and availability by default: per-branch location "
+                "counts and copy status (available, loaned out, on the way, etc.). "
+                "Use title_id with library_availability for full detail or library_place_hold."
             ),
             "parameters": {
                 "type": "object",
@@ -92,8 +93,9 @@ def register(ctx):
         schema={
             "name": "library_availability",
             "description": (
-                "Check whether a specific library title is available for borrowing "
-                "or can be reserved. Requires the title_id from library_search."
+                "Check availability for a specific title. Returns per-branch location "
+                "counts, copy status (available, loaned out, on the way, etc.), return "
+                "dates, and whether a hold can be placed. Requires title_id from library_search."
             ),
             "parameters": {
                 "type": "object",

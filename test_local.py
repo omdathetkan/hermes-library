@@ -72,7 +72,16 @@ def test_search(client: LibraryClient):
     print(f"  Total matches: {results['total']}")
     for r in results["results"]:
         tid = r["title_id"] or "?"
-        print(f"  [{tid:>8}] {r['title']} ({r['year']}) — {r['author']}")
+        avail = "available" if r.get("available") else "not available"
+        print(f"  [{tid:>8}] {r['title']} ({r['year']}) — {r['author']}  [{avail}]")
+        for loc in r.get("locations", []):
+            shelves = ", ".join(loc.get("shelves") or [])
+            ret = f"  return: {loc['return_date'][:10]}" if loc.get("return_date") else ""
+            print(
+                f"           {loc.get('branch_name')}: {loc.get('count')}x "
+                f"{loc.get('status_label')}{ret}"
+                + (f"  ({shelves})" if shelves else "")
+            )
 
     if results["results"]:
         tid = next((r["title_id"] for r in results["results"] if r["title_id"]), None)
@@ -81,8 +90,11 @@ def test_search(client: LibraryClient):
             avail = client.check_availability(tid)
             print(f"  available    : {avail['available']}")
             print(f"  hold_allowed : {avail['hold_allowed']}")
-            for a in avail.get("availability", []):
-                print(f"  status       : {a.get('status')} ({a.get('statusCode')})")
+            for loc in avail.get("locations", []):
+                print(
+                    f"  {loc.get('branch_name')}: {loc.get('count')}x "
+                    f"{loc.get('status_label')}"
+                )
 
 
 def test_loans(client: LibraryClient):
