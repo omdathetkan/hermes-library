@@ -86,17 +86,23 @@ def test_search(client: LibraryClient):
 
 
 def test_loans(client: LibraryClient):
-    section("Current loans (items you have borrowed)")
-    loans = client.list_loans()
-    if not loans:
-        print("  (no active loans)")
-    for loan in loans:
-        due = loan["due_date"] or loan["renewed_due_date"] or "?"
-        fine = f"  ⚠ fine: €{loan['fine']:.2f}" if loan["fine"] else ""
-        renew = "✓ renewable" if loan["can_be_renewed"] else "✗ not renewable"
-        print(f"  [{loan['loan_id']}] {loan['title']}")
-        print(f"         author: {loan['author']}")
-        print(f"         lent:   {loan['loan_date']}  due: {due}  {renew}{fine}")
+    section("Current loans (all linked accounts)")
+    accounts = client.list_loans()
+    if not accounts:
+        print("  (no accounts)")
+        return
+    for account_name, account in accounts.items():
+        loans = account["loans"]
+        print(f"\n  {account_name} ({len(loans)} loans)")
+        if not loans:
+            print("    (no active loans)")
+        for loan in loans:
+            due = loan["due_date"] or loan["renewed_due_date"] or "?"
+            fine = f"  ⚠ fine: €{loan['fine']:.2f}" if loan["fine"] else ""
+            renew = "✓ renewable" if loan["can_be_renewed"] else "✗ not renewable"
+            print(f"    [{loan['loan_id']}] {loan['title']}")
+            print(f"           author: {loan['author']}")
+            print(f"           lent:   {loan['loan_date']}  due: {due}  {renew}{fine}")
 
 
 def test_holds(client: LibraryClient):

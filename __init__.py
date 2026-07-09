@@ -117,13 +117,14 @@ def register(ctx):
     ctx.register_tool(
         name="library_list_loans",
         toolset="bibliotheek",
-        description="List all items currently on loan (borrowed) by the logged-in library member.",
+        description="List all items on loan across the logged-in member and linked accounts.",
         schema={
             "name": "library_list_loans",
             "description": (
-                "List all library items currently borrowed by the logged-in member. "
-                "Shows title, author, loan date, due date, whether renewal is possible, "
-                "and any outstanding fines."
+                "List all library items currently on loan, grouped by account name. "
+                "Includes the logged-in member and any linked accounts (e.g. children). "
+                "Each account has patron_id and a loans list with title, author, loan date, "
+                "due date, renewal status, and fines."
             ),
             "parameters": {
                 "type": "object",

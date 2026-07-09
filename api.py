@@ -364,6 +364,7 @@ class LibraryClient:
         self.wise_key = _compute_wise_key(branch_id)
         self._access_token: str | None = None
         self._patron_id: str | None = None
+        self._actor_name: str | None = None
         self._redirect_uri = (
             f"https://bibliotheek.wise.oclc.org/wise-apps/opac"
             f"/branch/{branch_id}/my-account/checkouts/physical-materials"
@@ -524,9 +525,56 @@ class LibraryClient:
 
         claims = _decode_jwt_payload(self._access_token)
         self._patron_id = claims.get("wiseUuid")
+        self._actor_name = claims.get("actorName")
 
         if not self._patron_id:
             raise RuntimeError("Access token has no wiseUuid claim; cannot identify patron.")
+
+    def _get_delegated_patrons(self) -> list[tuple[str, str]]:
+        """Return (display_name, patron_system_id) for linked child accounts."""
+        items = _api_json(
+            "GET",
+            f"{WISE_BASE}/patron/{self._patron_id}/delegator",
+            params={
+                "function": "MAY_RENEW",
+                "status": "OK",
+                "addOutgoingDelegations": "false",
+            },
+            headers=self._headers(auth=True),
+        )
+        patrons: list[tuple[str, str]] = []
+        for item in items:
+            name = item.get("relatedPatronName")
+            patron_id = item.get("relatedPatronSystemId")
+            if name and patron_id:
+                patrons.append((name, patron_id))
+        return patrons
+
+    @staticmethod
+    def _format_loan_item(item: dict) -> dict:
+        return {
+            "loan_id": item.get("id"),
+            "title": item.get("title"),
+            "author": item.get("author"),
+            "loan_date": item.get("loanDate"),
+            "due_date": item.get("dueDate"),
+            "renewed_due_date": item.get("newDueDate"),
+            "renewable": item.get("itemRenewable", False),
+            "can_be_renewed": item.get("canBeRenewed", False),
+            "branch": item.get("loanBranchName"),
+            "media": item.get("medium"),
+            "fine": item.get("fine", 0.0),
+            "bibliographic_record_id": item.get("bibliographicRecordId"),
+        }
+
+    def _list_loans_for_patron(self, patron_id: str) -> list[dict]:
+        data = _api_json(
+            "GET",
+            f"{WISE_BASE}/patron/{patron_id}/library/{self.library_id}/loan",
+            params={"offset": 0},
+            headers=self._headers(auth=True),
+        )
+        return [self._format_loan_item(item) for item in data.get("items", [])]
 
     # ------------------------------------------------------------------
     # Public API
@@ -666,41 +714,30 @@ class LibraryClient:
                 )
         return holds
 
-    def list_loans(self) -> list[dict]:
+    def list_loans(self) -> dict[str, dict]:
         """
-        Return all items currently on loan for the logged-in patron.
+        Return all items on loan, grouped by account name.
 
-        Each entry includes title, author, loan_date (when borrowed),
-        due_date (return deadline), renewable flag, and branch name.
+        Includes the logged-in patron and any linked accounts (e.g. children)
+        discovered via the delegator endpoint. Each account entry contains
+        patron_id and a loans list.
         """
         self.ensure_logged_in()
 
-        data = _api_json(
-            "GET",
-            f"{WISE_BASE}/patron/{self._patron_id}/library/{self.library_id}/loan",
-            params={"offset": 0},
-            headers=self._headers(auth=True),
-        )
+        accounts: dict[str, dict] = {}
+        primary_name = self._actor_name or "Primary account"
+        accounts[primary_name] = {
+            "patron_id": self._patron_id,
+            "loans": self._list_loans_for_patron(self._patron_id),
+        }
 
-        loans = []
-        for item in data.get("items", []):
-            loans.append(
-                {
-                    "loan_id": item.get("id"),
-                    "title": item.get("title"),
-                    "author": item.get("author"),
-                    "loan_date": item.get("loanDate"),
-                    "due_date": item.get("dueDate"),
-                    "renewed_due_date": item.get("newDueDate"),
-                    "renewable": item.get("itemRenewable", False),
-                    "can_be_renewed": item.get("canBeRenewed", False),
-                    "branch": item.get("loanBranchName"),
-                    "media": item.get("medium"),
-                    "fine": item.get("fine", 0.0),
-                    "bibliographic_record_id": item.get("bibliographicRecordId"),
-                }
-            )
-        return loans
+        for name, patron_id in self._get_delegated_patrons():
+            accounts[name] = {
+                "patron_id": patron_id,
+                "loans": self._list_loans_for_patron(patron_id),
+            }
+
+        return accounts
 
     def place_hold(
         self,
